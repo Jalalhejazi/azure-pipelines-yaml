@@ -1,0 +1,134 @@
+# azure function build and release pipeline
+name: 'azureFunctionPipeline'
+
+trigger:
+- master
+
+variables:
+  csProj: '**/*.csproj'
+  azureSubscription: '<subscriptionServiceEndpointName>'
+  resourceGroupName: '<resourceGroupName>'
+  resourceGroupLocation: 'WestUS'
+  azureFunctionName: '<azureFunctionName>'
+  azureFunctionUrl: '<azureFunctionName>.azurewebsites.net'
+  buildPlatform: 'Any CPU'
+  buildConfiguration: 'Release'
+
+stages:
+- stage: Build
+  jobs:
+  - job: 'DotNetCoreBuild'
+    workspace:
+      clean: all
+    pool:
+      vmImage: 'vs2017-win2016'
+    steps:
+    
+    - task: DotNetCoreCLI@2
+      condition: succeeded()
+      displayName: 'dotnet restore'
+      inputs:
+        command: restore
+        projects: '$(csProj)'
+
+    - task: DotNetCoreCLI@2
+      condition: succeeded()
+      displayName: 'dotnet build'
+      inputs:
+        projects: '$(csProj)'
+
+    - task: DotNetCoreCLI@2
+      condition: succeeded()
+      displayName: 'dotnet test'
+      inputs:
+        command: test
+        projects: '$(csProj)'
+
+    - task: DotNetCoreCLI@2
+      condition: succeeded()
+      displayName: 'dotnet publish'
+      inputs:
+        command: publish
+        publishWebProjects: false
+        projects: '$(csProj)'
+        arguments: '--no-restore --configuration Release --output $(Build.ArtifactStagingDirectory)'
+
+    - task: CopyFiles@2
+      condition: succeeded()
+      inputs:
+        sourceFolder: '$(Build.SourcesDirectory)'
+        contents: '**\Function.*json' 
+        targetFolder: $(Build.ArtifactStagingDirectory)
+
+    - task: PublishBuildArtifacts@1
+      condition: succeeded()
+      displayName: 'Publish Artifact: drop'
+
+- stage: Release
+  condition: succeeded()
+  jobs:
+    - deployment: 'Development'
+      environment: 'Development'
+      pool:
+        vmImage: 'vs2017-win2016'
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+
+            - task: AzureResourceGroupDeployment@2
+              condition: succeeded()
+              displayName: 'ARM Deployment'
+              inputs:
+                azureSubscription: '$(azureSubscription)'
+                action: 'Create Or Update Resource Group'
+                resourceGroupName: '$(resourceGroupName)'
+                location: '$(resourceGroupLocation)'
+                templateLocation: 'Linked artifact'
+                csmFile: '$(Pipeline.Workspace)/drop/*/Function.json'
+                csmParametersFile: '$(Pipeline.Workspace)/drop/*/Function.parameters.json'
+                deploymentMode: Complete
+
+            - task: AzureFunctionApp@1
+              condition: succeeded()
+              displayName: 'Deploy Azure Function App'
+              inputs:
+                azureSubscription: '$(azureSubscription)'
+                resourceGroupName: '$(resourceGroupName)'
+                appType: 'functionApp'
+                appName: '$(azureFunctionName)'
+                package: '$(Pipeline.Workspace)/**/*.zip'
+                deploymentMethod: 'auto'
+                deployToSlotOrASE: 'dev'
+
+            - powershell: |
+                if (-not (Get-Module -Name Pester -ListAvailable))
+                {
+                    Install-Module -Name Pester -Scope CurrentUser -Force;
+                }
+                $pester = 'Describe "Integration tests" {It "Function is responsive" {$req = Invoke-WebRequest -Method get -Uri "$(azureFunctionUrl)" -UseBasicParsing;$req.StatusCode | Should Be 200;}}'
+                $pester | Out-File -FilePath "$(Pipeline.Workspace)\integrationTests.tests.ps1";
+                Invoke-Pester -Script @{ Path = "$(Pipeline.Workspace)\integrationTests.tests.ps1"} -OutputFile "$(Pipeline.Workspace)\integrationTests.results.xml" -OutputFormat NUnitXML;
+              displayName: 'Run integration tests'
+              condition: succeeded()
+
+            - task: PublishTestResults@2
+              displayName: 'Publish test results'
+              condition: succeeded()
+              inputs:
+                testResultsFormat: 'NUnit'
+                testResultsFiles: 'integrationTests.results.xml' 
+                searchFolder: '$(Pipeline.Workspace)'
+
+            - task: AzureAppServiceManage@0
+              condition: succeeded()
+              enabled: false
+              displayName: 'Swap deployment slots'
+              inputs:
+                azureSubscription: '$(azureSubscription)'
+                resourceGroupName: '$(resourceGroupName)'
+                action: 'Swap Slots'
+                webAppName: '$(azureFunctionName)'
+                sourceSlot: 'dev'
+                swapWithProduction: true
+                
